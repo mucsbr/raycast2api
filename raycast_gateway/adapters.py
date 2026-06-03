@@ -41,6 +41,7 @@ class ResponsesStreamState:
     include_usage: bool = False
     input_token_estimate: int | None = None
     message_item_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
+    reasoning_item_id: str = field(default_factory=lambda: f"rs_{uuid.uuid4().hex}")
     sequence_number: int = 0
     output_started: bool = False
     content_started: bool = False
@@ -267,7 +268,7 @@ def internal_chunk_to_response_events(
                 state,
                 "response.reasoning_text.delta",
                 response_id=state.request_id,
-                item_id=f"rs_{state.request_id.removeprefix('resp_')}",
+                item_id=state.reasoning_item_id,
                 output_index=1 if state.output_started else 0,
                 content_index=0,
                 delta=reasoning_text,
@@ -371,6 +372,8 @@ def final_response_stream_events(
                 usage=state.usage,
                 request_payload=request_payload,
                 input_token_estimate=state.input_token_estimate,
+                message_item_id=state.message_item_id,
+                reasoning_item_id=state.reasoning_item_id,
             ),
         )
     )
@@ -400,6 +403,8 @@ def response_failed_event(
             error=error,
             include_empty_message=False,
             input_token_estimate=state.input_token_estimate,
+            message_item_id=state.message_item_id,
+            reasoning_item_id=state.reasoning_item_id,
         ),
     )
 
@@ -563,6 +568,8 @@ def aggregate_responses_response(
         usage=usage,
         request_payload=request_payload,
         input_token_estimate=input_token_estimate,
+        message_item_id=state.message_item_id,
+        reasoning_item_id=state.reasoning_item_id,
     )
 
 
@@ -1421,12 +1428,16 @@ def _response_object_from_parts(
     error: dict[str, Any] | None = None,
     include_empty_message: bool = True,
     input_token_estimate: int | None = None,
+    message_item_id: str | None = None,
+    reasoning_item_id: str | None = None,
 ) -> dict[str, Any]:
     output = _response_output_items(
         output_text,
         reasoning_text,
         tool_calls,
         include_empty_message=include_empty_message,
+        message_item_id=message_item_id,
+        reasoning_item_id=reasoning_item_id,
     )
     response: dict[str, Any] = {
         "id": request_id,
@@ -1460,14 +1471,21 @@ def _response_output_items(
     tool_calls: list[dict[str, Any]],
     *,
     include_empty_message: bool = True,
+    message_item_id: str | None = None,
+    reasoning_item_id: str | None = None,
 ) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     if output_text or (include_empty_message and not tool_calls):
-        output.append(_response_message_item(f"msg_{uuid.uuid4().hex}", output_text))
+        output.append(
+            _response_message_item(
+                message_item_id or f"msg_{uuid.uuid4().hex}",
+                output_text,
+            )
+        )
     if reasoning_text:
         output.append(
             {
-                "id": f"rs_{uuid.uuid4().hex}",
+                "id": reasoning_item_id or f"rs_{uuid.uuid4().hex}",
                 "type": "reasoning",
                 "status": "completed",
                 "summary": [],

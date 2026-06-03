@@ -1024,6 +1024,8 @@ def test_streaming_responses_events_emit_typed_sse_payloads():
     assert finish_events == []
     assert final_events[-1]["type"] == "response.completed"
     assert final_events[-1]["response"]["output_text"] == "今"
+    assert final_events[-1]["response"]["output"][0]["id"] == text_events[0]["item"]["id"]
+    assert final_events[-1]["response"]["output"][0]["id"] == final_events[2]["item"]["id"]
     assert final_events[-1]["response"]["tools"] == []
     assert "instructions" not in final_events[-1]["response"]
     assert final_events[-1]["response"]["usage"]["input_tokens"] == 50
