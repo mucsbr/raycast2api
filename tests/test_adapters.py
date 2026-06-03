@@ -826,6 +826,61 @@ def test_streaming_chat_tool_call_arguments_are_incremental():
     assert "tool_calls" not in third[0]["choices"][0]["delta"]
 
 
+def test_streaming_chat_tool_call_indexes_are_remapped_to_openai_indexes():
+    state = StreamState(
+        request_id="chatcmpl_test",
+        model="claude-opus-4-8",
+        created=1780469337,
+    )
+
+    first = internal_chunk_to_openai_chunks(
+        {
+            "tool_calls": [
+                {
+                    "id": "toolu_123",
+                    "index": 2,
+                    "function": {"name": "Edit", "arguments": ""},
+                }
+            ]
+        },
+        state,
+    )
+    second = internal_chunk_to_openai_chunks(
+        {
+            "tool_calls": [
+                {
+                    "id": "",
+                    "index": 2,
+                    "function": {"name": "", "arguments": "{\"file_"},
+                }
+            ]
+        },
+        state,
+    )
+    third = internal_chunk_to_openai_chunks(
+        {
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+                {
+                    "id": "toolu_123",
+                    "index": 3,
+                    "function": {
+                        "name": "Edit",
+                        "arguments": "{\"file_path\":\"111.txt\"}",
+                    },
+                }
+            ],
+        },
+        state,
+    )
+
+    assert first[1]["choices"][0]["delta"]["tool_calls"][0]["index"] == 0
+    assert second[0]["choices"][0]["delta"]["tool_calls"][0]["index"] == 0
+    assert third[0]["choices"][0]["finish_reason"] == "tool_calls"
+    assert "tool_calls" not in third[0]["choices"][0]["delta"]
+    assert state.tool_call_count == 1
+
+
 def test_usage_chunk_is_emitted_only_when_requested():
     state = StreamState(
         request_id="chatcmpl_test",

@@ -31,6 +31,9 @@ class StreamState:
     done_sent: bool = False
     tool_call_count: int = 0
     tool_call_buffers: dict[int, ToolCallBuffer] = field(default_factory=dict)
+    tool_call_id_map: dict[str, int] = field(default_factory=dict)
+    tool_call_index_map: dict[int, int] = field(default_factory=dict)
+    last_tool_call_index: int | None = None
 
 
 @dataclass
@@ -1121,15 +1124,13 @@ def _tool_call_deltas_to_openai(
 ) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for tool_call in tool_calls:
-        source_index = _tool_call_source_index(tool_call, state.tool_call_count)
+        source_index = _openai_tool_call_index(tool_call, state)
         buffer = _get_or_create_tool_call_buffer(
             state.tool_call_buffers,
             source_index,
             tool_call,
             output_index=source_index,
         )
-        if source_index >= state.tool_call_count:
-            state.tool_call_count = source_index + 1
         if buffer is None:
             continue
 
@@ -1167,6 +1168,46 @@ def _tool_call_deltas_to_openai(
             buffer.completed = True
 
     return converted
+
+
+def _openai_tool_call_index(tool_call: dict[str, Any], state: StreamState) -> int:
+    raw_index = _raw_tool_call_source_index(tool_call)
+    raw_id = _tool_call_id(tool_call)
+
+    if raw_id and raw_id in state.tool_call_id_map:
+        index = state.tool_call_id_map[raw_id]
+        if raw_index is not None:
+            state.tool_call_index_map[raw_index] = index
+        state.last_tool_call_index = index
+        return index
+
+    if raw_index is not None and raw_index in state.tool_call_index_map:
+        index = state.tool_call_index_map[raw_index]
+        if raw_id:
+            state.tool_call_id_map[raw_id] = index
+        state.last_tool_call_index = index
+        return index
+
+    if raw_id:
+        for index, buffer in state.tool_call_buffers.items():
+            if buffer.call_id == raw_id:
+                state.tool_call_id_map[raw_id] = index
+                if raw_index is not None:
+                    state.tool_call_index_map[raw_index] = index
+                state.last_tool_call_index = index
+                return index
+
+    if raw_index is None and not raw_id and state.last_tool_call_index is not None:
+        return state.last_tool_call_index
+
+    index = state.tool_call_count
+    state.tool_call_count += 1
+    if raw_index is not None:
+        state.tool_call_index_map[raw_index] = index
+    if raw_id:
+        state.tool_call_id_map[raw_id] = index
+    state.last_tool_call_index = index
+    return index
 
 
 def _arguments_to_string(arguments: Any) -> str:
@@ -1291,6 +1332,15 @@ def _tool_call_source_index(tool_call: dict[str, Any], default: int) -> int:
         return int(tool_call.get("index", default))
     except (TypeError, ValueError):
         return default
+
+
+def _raw_tool_call_source_index(tool_call: dict[str, Any]) -> int | None:
+    if "index" not in tool_call:
+        return None
+    try:
+        return int(tool_call.get("index"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _tool_call_id(tool_call: dict[str, Any]) -> str:
