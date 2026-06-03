@@ -73,7 +73,9 @@ def test_create_responses_endpoint_converts_request_and_response(monkeypatch):
     data = response.json()
     assert data["object"] == "response"
     assert data["output_text"] == "ok"
-    assert data["usage"]["total_tokens"] == 2
+    assert data["usage"]["input_tokens"] > 2
+    assert data["usage"]["output_tokens"] == 1
+    assert data["usage"]["total_tokens"] == data["usage"]["input_tokens"] + 1
     assert captured["company_payload"]["messages"] == [
         {"author": "user", "content": {"text": "hi"}}
     ]

@@ -7,6 +7,7 @@ from raycast_gateway.adapters import (
     company_sse_data_to_dict,
     encode_sse_data,
     encode_sse_event,
+    estimate_input_tokens,
     final_response_stream_events,
     internal_chunk_to_openai_chunks,
     internal_chunk_to_response_events,
@@ -368,7 +369,132 @@ def test_responses_request_function_call_output_maps_to_tool_message():
         {
             "role": "tool",
             "tool_call_id": "call_123",
+            "name": "lookup",
             "content": "{\"city\":\"上海\"}",
+        },
+    ]
+
+
+def test_responses_request_filters_partial_tool_call_history():
+    converted = responses_request_to_chat_payload(
+        {
+            "model": "claude-opus-4-8",
+            "input": [
+                {"role": "user", "content": "read file"},
+                {
+                    "type": "function_call",
+                    "call_id": "toolu_123",
+                    "name": "exec_command",
+                    "arguments": "",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "partial_1",
+                    "name": "",
+                    "arguments": "{\"cmd\":\"c",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "partial_2",
+                    "name": "",
+                    "arguments": "at 111.txt\"}",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "toolu_123",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"cat 111.txt\"}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "partial_1",
+                    "output": "unsupported call: ",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "toolu_123",
+                    "output": "hello 333",
+                },
+            ],
+        }
+    )
+
+    assert converted["messages"] == [
+        {"role": "user", "content": "read file"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "toolu_123",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"cat 111.txt\"}",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "toolu_123",
+            "name": "exec_command",
+            "content": "hello 333",
+        },
+    ]
+
+
+def test_responses_request_merges_assistant_text_with_tool_call_before_tool_result():
+    converted = responses_request_to_chat_payload(
+        {
+            "model": "claude-opus-4-8",
+            "input": [
+                {"role": "user", "content": "read file"},
+                {
+                    "type": "function_call",
+                    "call_id": "toolu_456",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"printf hi\"}",
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Need to update the file.",
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "toolu_456",
+                    "output": "hi",
+                },
+            ],
+        }
+    )
+
+    assert converted["messages"] == [
+        {"role": "user", "content": "read file"},
+        {
+            "role": "assistant",
+            "content": "Need to update the file.",
+            "tool_calls": [
+                {
+                    "id": "toolu_456",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"printf hi\"}",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "toolu_456",
+            "name": "exec_command",
+            "content": "hi",
         },
     ]
 
@@ -637,6 +763,69 @@ def test_internal_tool_call_and_finish_are_split_into_valid_chunks():
     assert chunks[2]["choices"][0]["finish_reason"] == "tool_calls"
 
 
+def test_streaming_chat_tool_call_arguments_are_incremental():
+    state = StreamState(
+        request_id="chatcmpl_test",
+        model="claude-opus-4-8",
+        created=1780469337,
+    )
+
+    first = internal_chunk_to_openai_chunks(
+        {
+            "tool_calls": [
+                {
+                    "id": "toolu_123",
+                    "index": 0,
+                    "function": {"name": "exec_command", "arguments": ""},
+                }
+            ]
+        },
+        state,
+    )
+    second = internal_chunk_to_openai_chunks(
+        {
+            "tool_calls": [
+                {
+                    "id": "",
+                    "index": 0,
+                    "function": {"name": "", "arguments": "{\"cmd\":\"c"},
+                }
+            ]
+        },
+        state,
+    )
+    third = internal_chunk_to_openai_chunks(
+        {
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+                {
+                    "id": "toolu_123",
+                    "index": 0,
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"cat 111.txt\"}",
+                    },
+                }
+            ],
+        },
+        state,
+    )
+
+    assert first[1]["choices"][0]["delta"]["tool_calls"] == [
+        {
+            "index": 0,
+            "id": "toolu_123",
+            "type": "function",
+            "function": {"name": "exec_command"},
+        }
+    ]
+    assert second[0]["choices"][0]["delta"]["tool_calls"][0]["function"] == {
+        "arguments": "{\"cmd\":\"c"
+    }
+    assert third[0]["choices"][0]["finish_reason"] == "tool_calls"
+    assert "tool_calls" not in third[0]["choices"][0]["delta"]
+
+
 def test_usage_chunk_is_emitted_only_when_requested():
     state = StreamState(
         request_id="chatcmpl_test",
@@ -661,6 +850,54 @@ def test_usage_chunk_is_emitted_only_when_requested():
     }
 
 
+def test_suspicious_stream_usage_uses_local_input_token_estimate():
+    state = StreamState(
+        request_id="chatcmpl_test",
+        model="gemini-3.5-flash",
+        created=1780469337,
+        include_usage=True,
+        input_token_estimate=120,
+    )
+
+    chunks = internal_chunk_to_openai_chunks(
+        {
+            "finish_reason": "STOP",
+            "usage": {"input_tokens": 2, "output_tokens": 14},
+        },
+        state,
+    )
+
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": 120,
+        "completion_tokens": 14,
+        "total_tokens": 134,
+    }
+
+
+def test_normal_stream_usage_keeps_upstream_input_tokens():
+    state = StreamState(
+        request_id="chatcmpl_test",
+        model="gemini-3.5-flash",
+        created=1780469337,
+        include_usage=True,
+        input_token_estimate=120,
+    )
+
+    chunks = internal_chunk_to_openai_chunks(
+        {
+            "finish_reason": "STOP",
+            "usage": {"input_tokens": 1413, "output_tokens": 14},
+        },
+        state,
+    )
+
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": 1413,
+        "completion_tokens": 14,
+        "total_tokens": 1427,
+    }
+
+
 def test_non_stream_response_aggregates_reasoning_extension():
     response = aggregate_openai_response(
         [
@@ -671,6 +908,7 @@ def test_non_stream_response_aggregates_reasoning_extension():
         request_id="chatcmpl_test",
         model="model",
         created=1,
+        input_token_estimate=80,
     )
 
     message = response["choices"][0]["message"]
@@ -678,6 +916,11 @@ def test_non_stream_response_aggregates_reasoning_extension():
     assert message["reasoning_content"] == "Thinking. "
     assert message["content"] == "Answer."
     assert response["choices"][0]["finish_reason"] == "stop"
+    assert response["usage"] == {
+        "prompt_tokens": 80,
+        "completion_tokens": 3,
+        "total_tokens": 83,
+    }
 
 
 def test_non_stream_responses_response_aggregates_output_and_usage():
@@ -694,6 +937,7 @@ def test_non_stream_responses_response_aggregates_output_and_usage():
         model="model",
         created=1,
         request_payload={"tool_choice": "auto", "tools": []},
+        input_token_estimate=80,
     )
 
     assert response["object"] == "response"
@@ -703,16 +947,21 @@ def test_non_stream_responses_response_aggregates_output_and_usage():
     assert response["output"][0]["content"][0]["text"] == "Answer."
     assert response["output"][1]["type"] == "reasoning"
     assert response["usage"] == {
-        "input_tokens": 2,
+        "input_tokens": 80,
         "input_tokens_details": {"cached_tokens": 0},
         "output_tokens": 3,
         "output_tokens_details": {"reasoning_tokens": 1},
-        "total_tokens": 5,
+        "total_tokens": 83,
     }
 
 
 def test_streaming_responses_events_emit_typed_sse_payloads():
-    state = ResponsesStreamState(request_id="resp_test", model="model", created=1)
+    state = ResponsesStreamState(
+        request_id="resp_test",
+        model="model",
+        created=1,
+        input_token_estimate=50,
+    )
 
     created = response_created_event(state)
     text_events = internal_chunk_to_response_events({"text": "今"}, state)
@@ -731,8 +980,99 @@ def test_streaming_responses_events_emit_typed_sse_payloads():
     assert finish_events == []
     assert final_events[-1]["type"] == "response.completed"
     assert final_events[-1]["response"]["output_text"] == "今"
-    assert final_events[-1]["response"]["usage"]["total_tokens"] == 3
+    assert final_events[-1]["response"]["usage"]["input_tokens"] == 50
+    assert final_events[-1]["response"]["usage"]["total_tokens"] == 51
     assert encode_sse_event(text_events[2]).startswith("event: response.output_text.delta\n")
+
+
+def test_estimate_input_tokens_uses_prompt_relevant_fields():
+    estimate = estimate_input_tokens(
+        {
+            "model": "gemini-3.5-flash",
+            "provider": "google",
+            "thread_id": "not-counted",
+            "messages": [{"author": "user", "content": {"text": "今天几号？天气怎么样？"}}],
+            "tools": [
+                {
+                    "type": "local_tool",
+                    "function": {
+                        "name": "location-get-current-location",
+                        "description": "Gets current location.",
+                        "parameters": {},
+                    },
+                }
+            ],
+        }
+    )
+
+    assert estimate >= 8
+
+
+def test_streaming_responses_tool_call_arguments_are_merged():
+    state = ResponsesStreamState(request_id="resp_test", model="model", created=1)
+
+    first = internal_chunk_to_response_events(
+        {
+            "tool_calls": [
+                {
+                    "id": "toolu_123",
+                    "index": 0,
+                    "function": {"name": "exec_command", "arguments": ""},
+                }
+            ]
+        },
+        state,
+    )
+    second = internal_chunk_to_response_events(
+        {
+            "tool_calls": [
+                {
+                    "id": "",
+                    "index": 0,
+                    "function": {"name": "", "arguments": "{\"cmd\":\"c"},
+                }
+            ]
+        },
+        state,
+    )
+    third = internal_chunk_to_response_events(
+        {
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+                {
+                    "id": "toolu_123",
+                    "index": 0,
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"cat 111.txt\"}",
+                    },
+                }
+            ],
+        },
+        state,
+    )
+
+    assert [event["type"] for event in first] == ["response.output_item.added"]
+    assert first[0]["item"]["call_id"] == "toolu_123"
+    assert [event["type"] for event in second] == [
+        "response.function_call_arguments.delta"
+    ]
+    assert second[0]["delta"] == "{\"cmd\":\"c"
+    assert [event["type"] for event in third] == [
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+    ]
+    assert third[0]["arguments"] == "{\"cmd\":\"cat 111.txt\"}"
+    assert state.tool_calls == [
+        {
+            "id": third[1]["item"]["id"],
+            "type": "function_call",
+            "status": "completed",
+            "call_id": "toolu_123",
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"cat 111.txt\"}",
+        }
+    ]
 
 
 def test_normalize_responses_usage_accepts_chat_usage_names():

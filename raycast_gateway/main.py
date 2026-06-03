@@ -19,6 +19,7 @@ from .adapters import (
     company_sse_data_to_dict,
     encode_sse_data,
     encode_sse_event,
+    estimate_input_tokens,
     final_openai_stream_chunks,
     final_response_stream_events,
     internal_chunk_to_openai_chunks,
@@ -93,6 +94,7 @@ async def create_chat_completion(request: Request) -> Response:
     created = utc_timestamp()
     model = payload.get("model") or company_payload.get("model", "")
     include_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
+    input_token_estimate = estimate_input_tokens(company_payload)
 
     if payload.get("stream", False):
         state = StreamState(
@@ -100,6 +102,7 @@ async def create_chat_completion(request: Request) -> Response:
             model=model,
             created=created,
             include_usage=include_usage,
+            input_token_estimate=input_token_estimate,
         )
         return StreamingResponse(
             _stream_company_as_openai(upstream_body, upstream_headers, state),
@@ -121,6 +124,7 @@ async def create_chat_completion(request: Request) -> Response:
             request_id=request_id,
             model=model,
             created=created,
+            input_token_estimate=input_token_estimate,
         )
     )
 
@@ -158,6 +162,7 @@ async def create_response(request: Request) -> Response:
     created = utc_timestamp()
     model = payload.get("model") or company_payload.get("model", "")
     include_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
+    input_token_estimate = estimate_input_tokens(company_payload)
 
     if payload.get("stream", False):
         state = ResponsesStreamState(
@@ -165,6 +170,7 @@ async def create_response(request: Request) -> Response:
             model=model,
             created=created,
             include_usage=include_usage,
+            input_token_estimate=input_token_estimate,
         )
         return StreamingResponse(
             _stream_company_as_responses(upstream_body, upstream_headers, state, payload),
@@ -187,6 +193,7 @@ async def create_response(request: Request) -> Response:
             model=model,
             created=created,
             request_payload=payload,
+            input_token_estimate=input_token_estimate,
         )
     )
 
@@ -528,10 +535,76 @@ def _debug_request_body(settings: Settings, label: str, payload: dict[str, Any])
     if not settings.debug_request_body:
         return
 
+    print(
+        f"[raycast-gateway request-summary:{label}] "
+        f"{json.dumps(_request_body_summary(payload), ensure_ascii=False, separators=(',', ':'))}",
+        file=sys.stderr,
+        flush=True,
+    )
+
     body = json.dumps(_redact_sensitive(payload), ensure_ascii=False, separators=(",", ":"))
     max_chars = max(settings.debug_request_body_max_chars, 0)
     rendered = body if len(body) <= max_chars else f"{body[:max_chars]}...<truncated>"
     print(f"[raycast-gateway request-body:{label}] {rendered}", file=sys.stderr, flush=True)
+
+
+def _request_body_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    messages = payload.get("messages") or []
+    if not isinstance(messages, list):
+        messages = []
+    tools = payload.get("tools") or []
+    if not isinstance(tools, list):
+        tools = []
+
+    return {
+        "model": payload.get("model"),
+        "provider": payload.get("provider"),
+        "reasoning_effort": payload.get("reasoning_effort"),
+        "reasoning": payload.get("reasoning"),
+        "instructions_len": len(str(payload.get("instructions") or "")),
+        "additional_system_instructions_len": len(
+            str(payload.get("additional_system_instructions") or "")
+        ),
+        "input_type": type(payload.get("input")).__name__ if "input" in payload else None,
+        "messages": [
+            {
+                "index": index,
+                "role": message.get("role"),
+                "author": message.get("author"),
+                "content_type": type(message.get("content")).__name__,
+                "content_len": _content_length(message.get("content")),
+                "tool_calls": len(message.get("tool_calls") or []),
+                "tool_call_id": message.get("tool_call_id"),
+                "name": message.get("name"),
+            }
+            for index, message in enumerate(messages)
+            if isinstance(message, dict)
+        ],
+        "tools": [
+            {
+                "index": index,
+                "type": tool.get("type"),
+                "name": tool.get("name") or (tool.get("function") or {}).get("name"),
+                "function_name": (tool.get("function") or {}).get("name"),
+            }
+            for index, tool in enumerate(tools)
+            if isinstance(tool, dict)
+        ],
+    }
+
+
+def _content_length(content: Any) -> int:
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, dict):
+        if isinstance(content.get("text"), str):
+            return len(content["text"])
+        return len(json.dumps(content, ensure_ascii=False))
+    if isinstance(content, list):
+        return sum(_content_length(item) for item in content)
+    return len(str(content))
 
 
 def _redact_sensitive(value: Any) -> Any:

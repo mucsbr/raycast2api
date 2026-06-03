@@ -26,9 +26,11 @@ class StreamState:
     model: str
     created: int
     include_usage: bool = False
+    input_token_estimate: int | None = None
     role_sent: bool = False
     done_sent: bool = False
     tool_call_count: int = 0
+    tool_call_buffers: dict[int, ToolCallBuffer] = field(default_factory=dict)
 
 
 @dataclass
@@ -37,6 +39,7 @@ class ResponsesStreamState:
     model: str
     created: int
     include_usage: bool = False
+    input_token_estimate: int | None = None
     message_item_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
     sequence_number: int = 0
     output_started: bool = False
@@ -45,8 +48,21 @@ class ResponsesStreamState:
     text_parts: list[str] = field(default_factory=list)
     reasoning_parts: list[str] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_call_buffers: dict[int, ToolCallBuffer] = field(default_factory=dict)
     usage: dict[str, Any] | None = None
     finish_reason: str | None = None
+
+
+@dataclass
+class ToolCallBuffer:
+    source_index: int
+    call_id: str
+    name: str
+    output_index: int = 0
+    response_item_id: str = field(default_factory=lambda: f"fc_{uuid.uuid4().hex}")
+    arguments_parts: list[str] = field(default_factory=list)
+    added: bool = False
+    completed: bool = False
 
 
 def new_chat_completion_id() -> str:
@@ -104,6 +120,25 @@ def openai_request_to_company_payload(
         company_payload["additional_system_instructions"] = payload["additional_system_instructions"]
 
     return {key: value for key, value in company_payload.items() if value is not None}
+
+
+def estimate_input_tokens(payload: dict[str, Any]) -> int:
+    token_payload: dict[str, Any] = {}
+    for key in (
+        "additional_system_instructions",
+        "current_date",
+        "locale",
+        "messages",
+        "system_instruction",
+        "tool_choice",
+        "tools",
+    ):
+        if key in payload:
+            token_payload[key] = payload[key]
+
+    value = token_payload if token_payload else payload
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return _estimate_text_tokens(serialized)
 
 
 def responses_request_to_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -174,11 +209,13 @@ def internal_chunk_to_openai_chunks(
     if text:
         chunks.append(_stream_chunk(state, {"content": str(text)}))
 
+    finish_reason = normalize_finish_reason(internal.get("finish_reason"))
     tool_calls = internal.get("tool_calls") or []
     if tool_calls:
-        chunks.append(_stream_chunk(state, {"tool_calls": _tool_calls_to_openai(tool_calls, state)}))
+        openai_tool_calls = _tool_call_deltas_to_openai(tool_calls, state, finish_reason)
+        if openai_tool_calls:
+            chunks.append(_stream_chunk(state, {"tool_calls": openai_tool_calls}))
 
-    finish_reason = normalize_finish_reason(internal.get("finish_reason"))
     if finish_reason:
         chunks.append(_stream_chunk(state, {}, finish_reason=finish_reason))
 
@@ -254,31 +291,11 @@ def internal_chunk_to_response_events(
             )
         )
 
+    finish_reason = normalize_finish_reason(internal.get("finish_reason"))
     tool_calls = internal.get("tool_calls") or []
     if tool_calls:
-        for tool_call in _tool_calls_to_response_items(tool_calls):
-            output_index = (1 if state.output_started else 0) + len(state.tool_calls)
-            state.tool_calls.append(tool_call)
-            events.append(
-                _response_event(
-                    state,
-                    "response.output_item.added",
-                    response_id=state.request_id,
-                    output_index=output_index,
-                    item={**tool_call, "status": "in_progress"},
-                )
-            )
-            events.append(
-                _response_event(
-                    state,
-                    "response.output_item.done",
-                    response_id=state.request_id,
-                    output_index=output_index,
-                    item=tool_call,
-                )
-            )
+        events.extend(_tool_call_events_to_responses(tool_calls, state, finish_reason))
 
-    finish_reason = normalize_finish_reason(internal.get("finish_reason"))
     if finish_reason:
         state.finish_reason = finish_reason
 
@@ -353,6 +370,7 @@ def final_response_stream_events(
                 tool_calls=state.tool_calls,
                 usage=state.usage,
                 request_payload=request_payload,
+                input_token_estimate=state.input_token_estimate,
             ),
         )
     )
@@ -381,6 +399,7 @@ def response_failed_event(
             request_payload=request_payload,
             error=error,
             include_empty_message=False,
+            input_token_estimate=state.input_token_estimate,
         ),
     )
 
@@ -447,6 +466,7 @@ def aggregate_openai_response(
     request_id: str,
     model: str,
     created: int,
+    input_token_estimate: int | None = None,
 ) -> dict[str, Any]:
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
@@ -461,11 +481,21 @@ def aggregate_openai_response(
         if internal.get("reasoning"):
             reasoning_parts.append(str(internal["reasoning"]))
         if internal.get("tool_calls"):
-            tool_calls.extend(_tool_calls_to_openai(internal["tool_calls"], state))
+            finish_reason_for_tool = normalize_finish_reason(internal.get("finish_reason"))
+            _tool_call_deltas_to_openai(
+                internal["tool_calls"],
+                state,
+                finish_reason_for_tool,
+            )
         if internal.get("finish_reason"):
             finish_reason = normalize_finish_reason(internal["finish_reason"])
         if internal.get("usage"):
-            usage = normalize_usage(internal["usage"])
+            usage = normalize_usage(
+                internal["usage"],
+                input_token_estimate=input_token_estimate,
+            )
+
+    tool_calls = [_tool_call_buffer_to_openai(buffer) for buffer in _completed_tool_call_buffers(state.tool_call_buffers)]
 
     message: dict[str, Any] = {
         "role": "assistant",
@@ -501,11 +531,13 @@ def aggregate_responses_response(
     model: str,
     created: int,
     request_payload: dict[str, Any] | None = None,
+    input_token_estimate: int | None = None,
 ) -> dict[str, Any]:
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     usage: dict[str, Any] | None = None
+    state = ResponsesStreamState(request_id=request_id, model=model, created=created)
 
     for internal in internal_chunks:
         if internal.get("text"):
@@ -513,9 +545,12 @@ def aggregate_responses_response(
         if internal.get("reasoning"):
             reasoning_parts.append(str(internal["reasoning"]))
         if internal.get("tool_calls"):
-            tool_calls.extend(_tool_calls_to_response_items(internal["tool_calls"]))
+            finish_reason = normalize_finish_reason(internal.get("finish_reason"))
+            _tool_call_events_to_responses(internal["tool_calls"], state, finish_reason)
         if internal.get("usage"):
             usage = internal["usage"]
+
+    tool_calls = state.tool_calls
 
     return _response_object_from_parts(
         request_id=request_id,
@@ -527,6 +562,7 @@ def aggregate_responses_response(
         tool_calls=tool_calls,
         usage=usage,
         request_payload=request_payload,
+        input_token_estimate=input_token_estimate,
     )
 
 
@@ -677,10 +713,20 @@ def normalize_finish_reason(reason: Any) -> str | None:
     return mapping.get(normalized, normalized.lower())
 
 
-def normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
+def normalize_usage(
+    usage: dict[str, Any],
+    *,
+    input_token_estimate: int | None = None,
+) -> dict[str, Any]:
     prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
     completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    prompt_tokens, input_overridden = _apply_input_token_estimate(
+        prompt_tokens,
+        input_token_estimate,
+    )
     total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+    if input_overridden or total_tokens < prompt_tokens + completion_tokens:
+        total_tokens = prompt_tokens + completion_tokens
     normalized: dict[str, Any] = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -693,10 +739,20 @@ def normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def normalize_responses_usage(usage: dict[str, Any]) -> dict[str, Any]:
+def normalize_responses_usage(
+    usage: dict[str, Any],
+    *,
+    input_token_estimate: int | None = None,
+) -> dict[str, Any]:
     input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
     output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+    input_tokens, input_overridden = _apply_input_token_estimate(
+        input_tokens,
+        input_token_estimate,
+    )
     total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    if input_overridden or total_tokens < input_tokens + output_tokens:
+        total_tokens = input_tokens + output_tokens
     input_details = usage.get("input_tokens_details")
     output_details = usage.get("output_tokens_details")
     if not isinstance(input_details, dict):
@@ -714,6 +770,64 @@ def normalize_responses_usage(usage: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _apply_input_token_estimate(
+    upstream_tokens: int,
+    input_token_estimate: int | None,
+) -> tuple[int, bool]:
+    if input_token_estimate is None:
+        return upstream_tokens, False
+    if upstream_tokens > 2:
+        return upstream_tokens, False
+    if input_token_estimate < 8:
+        return upstream_tokens, False
+    return input_token_estimate, True
+
+
+def _estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+
+    tokens = 0
+    ascii_run = 0
+
+    def flush_ascii_run() -> None:
+        nonlocal ascii_run, tokens
+        if ascii_run:
+            tokens += max(1, (ascii_run + 3) // 4)
+            ascii_run = 0
+
+    for char in text:
+        codepoint = ord(char)
+        if char.isspace():
+            flush_ascii_run()
+            continue
+        if _is_cjk_codepoint(codepoint):
+            flush_ascii_run()
+            tokens += 1
+            continue
+        if char.isascii() and (char.isalnum() or char in "_-"):
+            ascii_run += 1
+            continue
+        flush_ascii_run()
+        tokens += 1
+
+    flush_ascii_run()
+    return tokens
+
+
+def _is_cjk_codepoint(codepoint: int) -> bool:
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x2A6DF
+        or 0x2A700 <= codepoint <= 0x2B73F
+        or 0x2B740 <= codepoint <= 0x2B81F
+        or 0x2B820 <= codepoint <= 0x2CEAF
+        or 0x30000 <= codepoint <= 0x3134F
+    )
+
+
 def _responses_input_to_messages_and_instructions(
     input_value: Any,
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -725,11 +839,103 @@ def _responses_input_to_messages_and_instructions(
 
     messages: list[dict[str, Any]] = []
     instruction_parts: list[str] = []
+    pending_assistant_text_parts: list[str] = []
+    pending_tool_calls: dict[str, dict[str, Any]] = {}
+    pending_tool_call_order: list[str] = []
+    known_tool_call_names: dict[str, str] = {}
+
+    def flush_pending_assistant() -> None:
+        if not pending_tool_call_order and not pending_assistant_text_parts:
+            return
+        tool_calls = [
+            pending_tool_calls[call_id]
+            for call_id in pending_tool_call_order
+            if pending_tool_calls[call_id]["function"].get("name")
+        ]
+        content = "\n".join(part for part in pending_assistant_text_parts if part)
+        pending_assistant_text_parts.clear()
+        pending_tool_calls.clear()
+        pending_tool_call_order.clear()
+        if not tool_calls and not content:
+            return
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content if content else None,
+        }
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        messages.append(assistant_message)
+
     for item in input_value:
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            call_id = str(item.get("call_id") or item.get("id") or "")
+            name = str(item.get("name") or "")
+            arguments = _responses_content_to_text(item.get("arguments", ""))
+            if not call_id:
+                continue
+            if call_id not in pending_tool_calls:
+                if not name:
+                    continue
+                pending_tool_calls[call_id] = {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                }
+                pending_tool_call_order.append(call_id)
+            else:
+                function = pending_tool_calls[call_id]["function"]
+                if name:
+                    function["name"] = name
+                function["arguments"] = _merge_argument_text(
+                    str(function.get("arguments") or ""),
+                    arguments,
+                )
+            if name:
+                known_tool_call_names[call_id] = name
+            continue
+
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            call_id = str(item.get("call_id") or item.get("id") or "")
+            flush_pending_assistant()
+            if call_id and call_id in known_tool_call_names:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": known_tool_call_names[call_id],
+                        "content": _responses_content_to_text(
+                            item.get("output", item.get("content", ""))
+                        ),
+                    }
+                )
+            continue
+
         item_messages, item_instructions = _responses_item_to_messages_and_instructions(item)
-        messages.extend(item_messages)
+        for item_message in item_messages:
+            if item_message.get("role") == "assistant":
+                content = _content_to_text(item_message.get("content"))
+                if content:
+                    pending_assistant_text_parts.append(content)
+                for tool_call in item_message.get("tool_calls") or []:
+                    call_id = str(tool_call.get("id") or "")
+                    function = tool_call.get("function") or {}
+                    name = str(function.get("name") or tool_call.get("name") or "")
+                    if not call_id or not name:
+                        continue
+                    if call_id not in pending_tool_calls:
+                        pending_tool_call_order.append(call_id)
+                    pending_tool_calls[call_id] = tool_call
+                    known_tool_call_names[call_id] = name
+                continue
+
+            flush_pending_assistant()
+            messages.append(item_message)
         instruction_parts.extend(item_instructions)
 
+    flush_pending_assistant()
     return messages, instruction_parts
 
 
@@ -742,36 +948,6 @@ def _responses_item_to_messages_and_instructions(
         return [{"role": "user", "content": _responses_content_to_text(item)}], []
 
     item_type = item.get("type")
-    if item_type == "function_call":
-        call_id = str(item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}")
-        return [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": item.get("name"),
-                            "arguments": item.get("arguments", ""),
-                        },
-                    }
-                ],
-            }
-        ], []
-
-    if item_type == "function_call_output":
-        call_id = item.get("call_id") or item.get("id")
-        return [
-            {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": _responses_content_to_text(
-                    item.get("output", item.get("content", ""))
-                ),
-            }
-        ], []
 
     if item_type in {"input_text", "output_text"}:
         return [{"role": "user", "content": _responses_content_to_text(item)}], []
@@ -931,27 +1107,58 @@ def _function_tool_to_local_tool(function: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _tool_calls_to_openai(tool_calls: list[dict[str, Any]], state: StreamState) -> list[dict[str, Any]]:
+def _tool_call_deltas_to_openai(
+    tool_calls: list[dict[str, Any]],
+    state: StreamState,
+    finish_reason: str | None,
+) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for tool_call in tool_calls:
-        index = state.tool_call_count
-        state.tool_call_count += 1
-        converted.append(
-            {
-                "index": index,
-                "id": tool_call.get("id") or f"call_{uuid.uuid4().hex}",
-                "type": "function",
-                "function": {
-                    "name": tool_call.get("name")
-                    or tool_call.get("function", {}).get("name"),
-                    "arguments": _arguments_to_string(
-                        tool_call.get("arguments")
-                        if "arguments" in tool_call
-                        else tool_call.get("function", {}).get("arguments", "")
-                    ),
-                },
-            }
+        source_index = _tool_call_source_index(tool_call, state.tool_call_count)
+        buffer = _get_or_create_tool_call_buffer(
+            state.tool_call_buffers,
+            source_index,
+            tool_call,
+            output_index=source_index,
         )
+        if source_index >= state.tool_call_count:
+            state.tool_call_count = source_index + 1
+        if buffer is None:
+            continue
+
+        raw_id = _tool_call_id(tool_call)
+        raw_name = _tool_call_name(tool_call)
+        raw_arguments = _tool_call_arguments(tool_call)
+        delta: dict[str, Any] = {
+            "index": source_index,
+            "type": "function",
+            "function": {},
+        }
+
+        if raw_id and raw_id != buffer.call_id:
+            buffer.call_id = raw_id
+        if raw_name and raw_name != buffer.name:
+            buffer.name = raw_name
+
+        if raw_id and not buffer.added:
+            delta["id"] = raw_id
+        if raw_name and not buffer.added:
+            delta["function"]["name"] = raw_name
+
+        if raw_arguments:
+            if finish_reason == "tool_calls" and buffer.arguments_parts:
+                buffer.arguments_parts = [raw_arguments]
+            else:
+                buffer.arguments_parts.append(raw_arguments)
+                delta["function"]["arguments"] = raw_arguments
+
+        buffer.added = True
+        if delta["function"] or delta.get("id"):
+            converted.append(delta)
+
+        if finish_reason == "tool_calls":
+            buffer.completed = True
+
     return converted
 
 
@@ -961,6 +1168,200 @@ def _arguments_to_string(arguments: Any) -> str:
     if isinstance(arguments, str):
         return arguments
     return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+
+
+def _tool_call_events_to_responses(
+    tool_calls: list[dict[str, Any]],
+    state: ResponsesStreamState,
+    finish_reason: str | None,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for tool_call in tool_calls:
+        source_index = _tool_call_source_index(tool_call, len(state.tool_call_buffers))
+        output_index = (1 if state.output_started else 0) + len(state.tool_call_buffers)
+        buffer = _get_or_create_tool_call_buffer(
+            state.tool_call_buffers,
+            source_index,
+            tool_call,
+            output_index=output_index,
+        )
+        if buffer is None:
+            continue
+
+        raw_id = _tool_call_id(tool_call)
+        raw_name = _tool_call_name(tool_call)
+        raw_arguments = _tool_call_arguments(tool_call)
+        if raw_id:
+            buffer.call_id = raw_id
+        if raw_name:
+            buffer.name = raw_name
+
+        if not buffer.added and buffer.name:
+            buffer.added = True
+            events.append(
+                _response_event(
+                    state,
+                    "response.output_item.added",
+                    response_id=state.request_id,
+                    output_index=buffer.output_index,
+                    item={**_tool_call_buffer_to_response_item(buffer), "status": "in_progress"},
+                )
+            )
+
+        if raw_arguments:
+            if finish_reason == "tool_calls" and buffer.arguments_parts:
+                buffer.arguments_parts = [raw_arguments]
+            else:
+                buffer.arguments_parts.append(raw_arguments)
+                if buffer.added:
+                    events.append(
+                        _response_event(
+                            state,
+                            "response.function_call_arguments.delta",
+                            response_id=state.request_id,
+                            item_id=buffer.response_item_id,
+                            output_index=buffer.output_index,
+                            delta=raw_arguments,
+                        )
+                    )
+
+        if finish_reason == "tool_calls" and buffer.added and not buffer.completed:
+            buffer.completed = True
+            final_item = _tool_call_buffer_to_response_item(buffer)
+            state.tool_calls.append(final_item)
+            events.append(
+                _response_event(
+                    state,
+                    "response.function_call_arguments.done",
+                    response_id=state.request_id,
+                    item_id=buffer.response_item_id,
+                    output_index=buffer.output_index,
+                    arguments=final_item["arguments"],
+                )
+            )
+            events.append(
+                _response_event(
+                    state,
+                    "response.output_item.done",
+                    response_id=state.request_id,
+                    output_index=buffer.output_index,
+                    item=final_item,
+                )
+            )
+
+    return events
+
+
+def _get_or_create_tool_call_buffer(
+    buffers: dict[int, ToolCallBuffer],
+    source_index: int,
+    tool_call: dict[str, Any],
+    *,
+    output_index: int,
+) -> ToolCallBuffer | None:
+    buffer = buffers.get(source_index)
+    if buffer is not None:
+        return buffer
+
+    call_id = _tool_call_id(tool_call)
+    name = _tool_call_name(tool_call)
+    arguments = _tool_call_arguments(tool_call)
+    if not call_id and not name and not arguments:
+        return None
+
+    buffer = ToolCallBuffer(
+        source_index=source_index,
+        call_id=call_id or f"call_{uuid.uuid4().hex}",
+        name=name,
+        output_index=output_index,
+    )
+    buffers[source_index] = buffer
+    return buffer
+
+
+def _tool_call_source_index(tool_call: dict[str, Any], default: int) -> int:
+    try:
+        return int(tool_call.get("index", default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _tool_call_id(tool_call: dict[str, Any]) -> str:
+    return str(tool_call.get("id") or tool_call.get("call_id") or "")
+
+
+def _tool_call_name(tool_call: dict[str, Any]) -> str:
+    function = tool_call.get("function") or {}
+    return str(tool_call.get("name") or function.get("name") or "")
+
+
+def _tool_call_arguments(tool_call: dict[str, Any]) -> str:
+    function = tool_call.get("function") or {}
+    return _arguments_to_string(
+        tool_call.get("arguments")
+        if "arguments" in tool_call
+        else function.get("arguments", "")
+    )
+
+
+def _completed_tool_call_buffers(
+    buffers: dict[int, ToolCallBuffer],
+) -> list[ToolCallBuffer]:
+    return [
+        buffer
+        for _, buffer in sorted(buffers.items())
+        if buffer.completed and buffer.name
+    ]
+
+
+def _tool_call_buffer_arguments(buffer: ToolCallBuffer) -> str:
+    return "".join(buffer.arguments_parts)
+
+
+def _tool_call_buffer_to_openai(buffer: ToolCallBuffer) -> dict[str, Any]:
+    return {
+        "index": buffer.source_index,
+        "id": buffer.call_id,
+        "type": "function",
+        "function": {
+            "name": buffer.name,
+            "arguments": _tool_call_buffer_arguments(buffer),
+        },
+    }
+
+
+def _tool_call_buffer_to_response_item(buffer: ToolCallBuffer) -> dict[str, Any]:
+    return {
+        "id": buffer.response_item_id,
+        "type": "function_call",
+        "status": "completed",
+        "call_id": buffer.call_id,
+        "name": buffer.name,
+        "arguments": _tool_call_buffer_arguments(buffer),
+    }
+
+
+def _merge_argument_text(existing: str, incoming: str) -> str:
+    if not incoming:
+        return existing
+    if not existing:
+        return incoming
+    if _looks_like_complete_json(incoming):
+        return incoming
+    if _looks_like_complete_json(existing):
+        return existing
+    return existing + incoming
+
+
+def _looks_like_complete_json(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    try:
+        json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    return True
 
 
 def _ensure_response_text_output_events(state: ResponsesStreamState) -> list[dict[str, Any]]:
@@ -1019,6 +1420,7 @@ def _response_object_from_parts(
     request_payload: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
     include_empty_message: bool = True,
+    input_token_estimate: int | None = None,
 ) -> dict[str, Any]:
     request_payload = request_payload or {}
     output = _response_output_items(
@@ -1042,7 +1444,12 @@ def _response_object_from_parts(
         "store": request_payload.get("store", False),
         "tool_choice": request_payload.get("tool_choice", "auto"),
         "tools": request_payload.get("tools", []),
-        "usage": normalize_responses_usage(usage) if usage else None,
+        "usage": normalize_responses_usage(
+            usage,
+            input_token_estimate=input_token_estimate,
+        )
+        if usage
+        else None,
     }
 
     optional_keys = (
@@ -1108,27 +1515,6 @@ def _response_message_item(item_id: str, output_text: str) -> dict[str, Any]:
     }
 
 
-def _tool_calls_to_response_items(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [_tool_call_to_response_item(tool_call) for tool_call in tool_calls]
-
-
-def _tool_call_to_response_item(tool_call: dict[str, Any]) -> dict[str, Any]:
-    call_id = str(tool_call.get("id") or tool_call.get("call_id") or f"call_{uuid.uuid4().hex}")
-    function = tool_call.get("function") or {}
-    return {
-        "id": tool_call.get("response_id") or f"fc_{uuid.uuid4().hex}",
-        "type": "function_call",
-        "status": "completed",
-        "call_id": call_id,
-        "name": tool_call.get("name") or function.get("name"),
-        "arguments": _arguments_to_string(
-            tool_call.get("arguments")
-            if "arguments" in tool_call
-            else function.get("arguments", "")
-        ),
-    }
-
-
 def _stream_chunk(
     state: StreamState,
     delta: dict[str, Any],
@@ -1157,5 +1543,8 @@ def _usage_chunk(state: StreamState, usage: dict[str, Any]) -> dict[str, Any]:
         "created": state.created,
         "model": state.model,
         "choices": [],
-        "usage": normalize_usage(usage),
+        "usage": normalize_usage(
+            usage,
+            input_token_estimate=state.input_token_estimate,
+        ),
     }
