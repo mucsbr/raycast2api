@@ -979,7 +979,20 @@ def test_streaming_responses_events_emit_typed_sse_payloads():
         input_token_estimate=50,
     )
 
-    created = response_created_event(state)
+    created = response_created_event(
+        state,
+        request_payload={
+            "instructions": "Do not echo this.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Large tool definition should not be echoed.",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        },
+    )
     text_events = internal_chunk_to_response_events({"text": "今"}, state)
     finish_events = internal_chunk_to_response_events(
         {"finish_reason": "stop", "usage": {"input_tokens": 2, "output_tokens": 1}},
@@ -1002,6 +1015,8 @@ def test_streaming_responses_events_emit_typed_sse_payloads():
 
     assert created["type"] == "response.created"
     assert created["response"]["output"] == []
+    assert created["response"]["tools"] == []
+    assert "instructions" not in created["response"]
     assert text_events[0]["type"] == "response.output_item.added"
     assert text_events[1]["type"] == "response.content_part.added"
     assert text_events[2]["type"] == "response.output_text.delta"
