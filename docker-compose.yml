@@ -1,0 +1,12 @@
+services:
+  raycast-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: raycast-gateway:latest
+    container_name: raycast-gateway
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

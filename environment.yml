@@ -1,0 +1,13 @@
+name: raycast-gateway
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - fastapi==0.115.6
+      - httpx==0.28.1
+      - pydantic==2.10.4
+      - python-dotenv==1.2.2
+      - pytest==8.3.4
+      - uvicorn[standard]==0.34.0

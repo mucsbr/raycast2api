@@ -1,0 +1,16 @@
+[project]
+name = "raycast-gateway"
+version = "0.1.0"
+description = "OpenAI-like chat completions gateway for the company API."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.6",
+    "httpx==0.28.1",
+    "pydantic==2.10.4",
+    "python-dotenv==1.2.2",
+    "uvicorn[standard]==0.34.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
