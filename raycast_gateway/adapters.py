@@ -1422,7 +1422,6 @@ def _response_object_from_parts(
     include_empty_message: bool = True,
     input_token_estimate: int | None = None,
 ) -> dict[str, Any]:
-    request_payload = request_payload or {}
     output = _response_output_items(
         output_text,
         reasoning_text,
@@ -1439,11 +1438,11 @@ def _response_object_from_parts(
         "model": model,
         "output": output,
         "output_text": output_text,
-        "parallel_tool_calls": request_payload.get("parallel_tool_calls", True),
-        "previous_response_id": request_payload.get("previous_response_id"),
-        "store": request_payload.get("store", False),
-        "tool_choice": request_payload.get("tool_choice", "auto"),
-        "tools": request_payload.get("tools", []),
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "store": False,
+        "tool_choice": "auto",
+        "tools": [],
         "usage": normalize_responses_usage(
             usage,
             input_token_estimate=input_token_estimate,
@@ -1451,21 +1450,6 @@ def _response_object_from_parts(
         if usage
         else None,
     }
-
-    optional_keys = (
-        "instructions",
-        "max_output_tokens",
-        "metadata",
-        "reasoning",
-        "temperature",
-        "text",
-        "top_p",
-        "truncation",
-        "user",
-    )
-    for key in optional_keys:
-        if key in request_payload:
-            response[key] = request_payload[key]
 
     return response
 

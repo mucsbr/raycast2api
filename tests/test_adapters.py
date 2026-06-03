@@ -936,7 +936,19 @@ def test_non_stream_responses_response_aggregates_output_and_usage():
         request_id="resp_test",
         model="model",
         created=1,
-        request_payload={"tool_choice": "auto", "tools": []},
+        request_payload={
+            "instructions": "Do not echo this.",
+            "metadata": {"request": "metadata"},
+            "tool_choice": "required",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Large tool definition should not be echoed.",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        },
         input_token_estimate=80,
     )
 
@@ -946,6 +958,10 @@ def test_non_stream_responses_response_aggregates_output_and_usage():
     assert response["output"][0]["type"] == "message"
     assert response["output"][0]["content"][0]["text"] == "Answer."
     assert response["output"][1]["type"] == "reasoning"
+    assert response["tool_choice"] == "auto"
+    assert response["tools"] == []
+    assert "instructions" not in response
+    assert "metadata" not in response
     assert response["usage"] == {
         "input_tokens": 80,
         "input_tokens_details": {"cached_tokens": 0},
@@ -969,7 +985,20 @@ def test_streaming_responses_events_emit_typed_sse_payloads():
         {"finish_reason": "stop", "usage": {"input_tokens": 2, "output_tokens": 1}},
         state,
     )
-    final_events = final_response_stream_events(state)
+    final_events = final_response_stream_events(
+        state,
+        request_payload={
+            "instructions": "Do not echo this.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Large tool definition should not be echoed.",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        },
+    )
 
     assert created["type"] == "response.created"
     assert created["response"]["output"] == []
@@ -980,6 +1009,8 @@ def test_streaming_responses_events_emit_typed_sse_payloads():
     assert finish_events == []
     assert final_events[-1]["type"] == "response.completed"
     assert final_events[-1]["response"]["output_text"] == "今"
+    assert final_events[-1]["response"]["tools"] == []
+    assert "instructions" not in final_events[-1]["response"]
     assert final_events[-1]["response"]["usage"]["input_tokens"] == 50
     assert final_events[-1]["response"]["usage"]["total_tokens"] == 51
     assert encode_sse_event(text_events[2]).startswith("event: response.output_text.delta\n")
