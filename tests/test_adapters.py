@@ -1,14 +1,22 @@
 from raycast_gateway.adapters import (
     GatewayDefaults,
+    ResponsesStreamState,
     StreamState,
     aggregate_openai_response,
+    aggregate_responses_response,
     company_sse_data_to_dict,
     encode_sse_data,
+    encode_sse_event,
+    final_response_stream_events,
     internal_chunk_to_openai_chunks,
+    internal_chunk_to_response_events,
     normalize_finish_reason,
+    normalize_responses_usage,
     openai_request_to_company_payload,
     raycast_model_catalog,
     raycast_models_to_openai_models,
+    response_created_event,
+    responses_request_to_chat_payload,
     resolve_model_for_company,
     resolve_reasoning_effort_for_company,
     split_model_for_company,
@@ -289,6 +297,113 @@ def test_top_level_reasoning_effort_overrides_responses_style_reasoning_effort()
     assert converted["reasoning_effort"] == "low"
 
 
+def test_responses_request_to_chat_payload_maps_input_and_instructions():
+    converted = responses_request_to_chat_payload(
+        {
+            "model": "claude-opus-4-8",
+            "instructions": "Answer in Chinese.",
+            "input": [
+                {
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "Be concise."}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "今天几号？"}],
+                },
+            ],
+            "reasoning": {"effort": "low"},
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "location-get-current-location",
+                    "description": "Gets current location.",
+                    "parameters": {},
+                }
+            ],
+        }
+    )
+
+    assert converted["messages"] == [{"role": "user", "content": "今天几号？"}]
+    assert converted["additional_system_instructions"] == "Answer in Chinese.\n\nBe concise."
+    assert converted["reasoning"] == {"effort": "low"}
+    assert converted["tools"][0]["name"] == "location-get-current-location"
+
+
+def test_responses_request_function_call_output_maps_to_tool_message():
+    converted = responses_request_to_chat_payload(
+        {
+            "model": "gemini-3.5-flash",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"weather\"}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "{\"city\":\"上海\"}",
+                },
+            ],
+        }
+    )
+
+    assert converted["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": "{\"q\":\"weather\"}",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_123",
+            "content": "{\"city\":\"上海\"}",
+        },
+    ]
+
+
+def test_responses_style_function_tools_are_local_tools_upstream():
+    converted = openai_request_to_company_payload(
+        responses_request_to_chat_payload(
+            {
+                "model": "gemini-3.5-flash",
+                "input": "hi",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "description": "Lookup data.",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            }
+        ),
+        defaults=GatewayDefaults(provider="google"),
+    )
+
+    assert converted["tools"] == [
+        {
+            "type": "local_tool",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup data.",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+
 def test_split_model_for_company_handles_raycast_catalog_ids():
     assert split_model_for_company("openai-gpt-5.4-mini", "google") == (
         "gpt-5.4-mini",
@@ -563,6 +678,71 @@ def test_non_stream_response_aggregates_reasoning_extension():
     assert message["reasoning_content"] == "Thinking. "
     assert message["content"] == "Answer."
     assert response["choices"][0]["finish_reason"] == "stop"
+
+
+def test_non_stream_responses_response_aggregates_output_and_usage():
+    response = aggregate_responses_response(
+        [
+            {"reasoning": "Thinking. "},
+            {"text": "Answer."},
+            {
+                "finish_reason": "STOP",
+                "usage": {"input_tokens": 2, "output_tokens": 3, "reasoning_tokens": 1},
+            },
+        ],
+        request_id="resp_test",
+        model="model",
+        created=1,
+        request_payload={"tool_choice": "auto", "tools": []},
+    )
+
+    assert response["object"] == "response"
+    assert response["status"] == "completed"
+    assert response["output_text"] == "Answer."
+    assert response["output"][0]["type"] == "message"
+    assert response["output"][0]["content"][0]["text"] == "Answer."
+    assert response["output"][1]["type"] == "reasoning"
+    assert response["usage"] == {
+        "input_tokens": 2,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 3,
+        "output_tokens_details": {"reasoning_tokens": 1},
+        "total_tokens": 5,
+    }
+
+
+def test_streaming_responses_events_emit_typed_sse_payloads():
+    state = ResponsesStreamState(request_id="resp_test", model="model", created=1)
+
+    created = response_created_event(state)
+    text_events = internal_chunk_to_response_events({"text": "今"}, state)
+    finish_events = internal_chunk_to_response_events(
+        {"finish_reason": "stop", "usage": {"input_tokens": 2, "output_tokens": 1}},
+        state,
+    )
+    final_events = final_response_stream_events(state)
+
+    assert created["type"] == "response.created"
+    assert created["response"]["output"] == []
+    assert text_events[0]["type"] == "response.output_item.added"
+    assert text_events[1]["type"] == "response.content_part.added"
+    assert text_events[2]["type"] == "response.output_text.delta"
+    assert text_events[2]["delta"] == "今"
+    assert finish_events == []
+    assert final_events[-1]["type"] == "response.completed"
+    assert final_events[-1]["response"]["output_text"] == "今"
+    assert final_events[-1]["response"]["usage"]["total_tokens"] == 3
+    assert encode_sse_event(text_events[2]).startswith("event: response.output_text.delta\n")
+
+
+def test_normalize_responses_usage_accepts_chat_usage_names():
+    assert normalize_responses_usage({"prompt_tokens": 2, "completion_tokens": 3}) == {
+        "input_tokens": 2,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 3,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": 5,
+    }
 
 
 def test_sse_helpers_parse_and_encode():

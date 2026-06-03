@@ -1,6 +1,6 @@
 # Raycast Gateway
 
-OpenAI-like `/v1/chat/completions` gateway for clients such as Raycast. The gateway accepts OpenAI-compatible chat requests, converts them to the company API request shape, then converts company API responses back to OpenAI-like responses.
+OpenAI-like `/v1/chat/completions` and `/v1/responses` gateway for clients such as Raycast. The gateway accepts OpenAI-compatible requests, converts them to the company API request shape, then converts company API responses back to OpenAI-like responses.
 
 ## Environment
 
@@ -46,6 +46,19 @@ The container reads `.env` through `docker-compose.yml` and exposes the gateway 
 ## OpenAI-like Behavior
 
 OpenAI-like tools are sent upstream as `local_tool` function definitions. The gateway does not emit `remote_tool` in company API requests; legacy `remote_tool` or `{ "name": "..." }` inputs are normalized to `local_tool`.
+
+`POST /v1/responses` supports the common Responses API subset: `input`, `instructions`, `tools`, `tool_choice`, `reasoning.effort`, and `stream`. The gateway converts `input` into the same message format used by `/v1/chat/completions`, sends `instructions` as Raycast `additional_system_instructions`, and returns an OpenAI-like `response` object:
+
+```json
+{
+  "model": "gemini-3.5-flash",
+  "instructions": "Answer in Chinese.",
+  "input": "今天几号？",
+  "reasoning": {"effort": "low"}
+}
+```
+
+Streaming `/v1/responses` returns typed SSE events such as `response.created`, `response.output_text.delta`, and `response.completed`, followed by `data: [DONE]`.
 
 `GET /v1/models` proxies Raycast's model catalog and returns an OpenAI-like model list:
 

@@ -12,16 +12,25 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .adapters import (
     OPENAI_DONE,
+    ResponsesStreamState,
     StreamState,
     aggregate_openai_response,
+    aggregate_responses_response,
     company_sse_data_to_dict,
     encode_sse_data,
+    encode_sse_event,
     final_openai_stream_chunks,
+    final_response_stream_events,
     internal_chunk_to_openai_chunks,
+    internal_chunk_to_response_events,
     new_chat_completion_id,
+    new_response_id,
     openai_request_to_company_payload,
     raycast_model_catalog,
     raycast_models_to_openai_models,
+    response_created_event,
+    response_failed_event,
+    responses_request_to_chat_payload,
     utc_timestamp,
 )
 from .config import Settings, get_settings
@@ -116,6 +125,72 @@ async def create_chat_completion(request: Request) -> Response:
     )
 
 
+@app.post("/v1/responses", response_model=None)
+async def create_response(request: Request) -> Response:
+    payload = await request.json()
+    settings = get_settings()
+    _debug_request_body(settings, "client", payload)
+    if not settings.company_api_url:
+        raise HTTPException(
+            status_code=500,
+            detail="COMPANY_API_URL is not configured",
+        )
+
+    try:
+        model_catalog = await _get_model_catalog(settings)
+    except httpx.HTTPError:
+        model_catalog = {}
+
+    chat_payload = responses_request_to_chat_payload(payload)
+    company_payload = openai_request_to_company_payload(
+        chat_payload,
+        defaults=settings.defaults,
+        model_catalog=model_catalog,
+    )
+    _log_request_summary(settings, company_payload)
+    _debug_request_body(settings, "company", company_payload)
+    try:
+        upstream_body, upstream_headers = _build_upstream_request(company_payload, settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    request_id = new_response_id()
+    created = utc_timestamp()
+    model = payload.get("model") or company_payload.get("model", "")
+    include_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
+
+    if payload.get("stream", False):
+        state = ResponsesStreamState(
+            request_id=request_id,
+            model=model,
+            created=created,
+            include_usage=include_usage,
+        )
+        return StreamingResponse(
+            _stream_company_as_responses(upstream_body, upstream_headers, state, payload),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    try:
+        internal_chunks = await _collect_company_response(upstream_body, upstream_headers)
+    except (httpx.HTTPError, UpstreamSSEError) as exc:
+        raise _upstream_http_exception(exc) from exc
+
+    return JSONResponse(
+        aggregate_responses_response(
+            internal_chunks,
+            request_id=request_id,
+            model=model,
+            created=created,
+            request_payload=payload,
+        )
+    )
+
+
 @app.get("/v1/models")
 async def list_models() -> JSONResponse:
     settings = get_settings()
@@ -154,6 +229,34 @@ async def _stream_company_as_openai(
 
     for chunk in final_openai_stream_chunks(state):
         yield encode_sse_data(chunk)
+    yield encode_sse_data(OPENAI_DONE)
+
+
+async def _stream_company_as_responses(
+    upstream_body: bytes,
+    upstream_headers: dict[str, str],
+    state: ResponsesStreamState,
+    request_payload: dict[str, Any],
+) -> AsyncIterator[str]:
+    yield encode_sse_event(response_created_event(state, request_payload=request_payload))
+
+    try:
+        async for internal in _iter_company_stream(upstream_body, upstream_headers):
+            for event in internal_chunk_to_response_events(internal, state):
+                yield encode_sse_event(event)
+    except (httpx.HTTPError, UpstreamSSEError) as exc:
+        yield encode_sse_event(
+            response_failed_event(
+                state,
+                error=_responses_error_payload(exc),
+                request_payload=request_payload,
+            )
+        )
+        yield encode_sse_data(OPENAI_DONE)
+        return
+
+    for event in final_response_stream_events(state, request_payload=request_payload):
+        yield encode_sse_event(event)
     yield encode_sse_data(OPENAI_DONE)
 
 
@@ -363,6 +466,18 @@ def _stream_error_chunk(state: StreamState, exc: httpx.HTTPError | UpstreamSSEEr
     else:
         message = f"Upstream request failed: {str(exc) or exc.__class__.__name__}"
     return _openai_stream_chunk(state, {"content": message})
+
+
+def _responses_error_payload(exc: httpx.HTTPError | UpstreamSSEError) -> dict[str, Any]:
+    if isinstance(exc, UpstreamSSEError):
+        return {
+            "type": exc.error_type,
+            "message": str(exc),
+        }
+    return {
+        "type": "upstream_request_failed",
+        "message": str(exc) or exc.__class__.__name__,
+    }
 
 
 def _openai_stream_chunk(

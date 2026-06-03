@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -31,8 +31,30 @@ class StreamState:
     tool_call_count: int = 0
 
 
+@dataclass
+class ResponsesStreamState:
+    request_id: str
+    model: str
+    created: int
+    include_usage: bool = False
+    message_item_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
+    sequence_number: int = 0
+    output_started: bool = False
+    content_started: bool = False
+    done_sent: bool = False
+    text_parts: list[str] = field(default_factory=list)
+    reasoning_parts: list[str] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    usage: dict[str, Any] | None = None
+    finish_reason: str | None = None
+
+
 def new_chat_completion_id() -> str:
     return f"chatcmpl_{uuid.uuid4().hex}"
+
+
+def new_response_id() -> str:
+    return f"resp_{uuid.uuid4().hex}"
 
 
 def utc_timestamp() -> int:
@@ -84,6 +106,53 @@ def openai_request_to_company_payload(
     return {key: value for key, value in company_payload.items() if value is not None}
 
 
+def responses_request_to_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    messages, instruction_parts = _responses_input_to_messages_and_instructions(
+        payload.get("input", payload.get("messages", []))
+    )
+
+    instructions = _responses_content_to_text(payload.get("instructions"))
+    if instructions:
+        instruction_parts.insert(0, instructions)
+    additional_system_instructions = _responses_content_to_text(
+        payload.get("additional_system_instructions")
+    )
+    if additional_system_instructions:
+        instruction_parts.append(additional_system_instructions)
+
+    chat_payload: dict[str, Any] = {
+        "model": payload.get("model"),
+        "messages": messages,
+        "stream": payload.get("stream", False),
+        "tool_choice": payload.get("tool_choice", "auto"),
+        "tools": payload.get("tools", []),
+    }
+
+    passthrough_keys = (
+        "current_date",
+        "debug",
+        "locale",
+        "message_id",
+        "provider",
+        "reasoning",
+        "reasoning_effort",
+        "source",
+        "system_instruction",
+        "temperature",
+        "thread_id",
+    )
+    for key in passthrough_keys:
+        if key in payload:
+            chat_payload[key] = payload[key]
+
+    if instruction_parts:
+        chat_payload["additional_system_instructions"] = "\n\n".join(
+            part for part in instruction_parts if part
+        )
+
+    return {key: value for key, value in chat_payload.items() if value is not None}
+
+
 def internal_chunk_to_openai_chunks(
     internal: dict[str, Any],
     state: StreamState,
@@ -118,6 +187,202 @@ def internal_chunk_to_openai_chunks(
         chunks.append(_usage_chunk(state, usage))
 
     return chunks
+
+
+def response_created_event(
+    state: ResponsesStreamState,
+    *,
+    request_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _response_event(
+        state,
+        "response.created",
+        response=_response_object_from_parts(
+            request_id=state.request_id,
+            model=state.model,
+            created=state.created,
+            status="in_progress",
+            output_text="",
+            reasoning_text="",
+            tool_calls=[],
+            usage=None,
+            request_payload=request_payload,
+            include_empty_message=False,
+        ),
+    )
+
+
+def internal_chunk_to_response_events(
+    internal: dict[str, Any],
+    state: ResponsesStreamState,
+) -> list[dict[str, Any]]:
+    if not _has_openai_visible_payload(internal):
+        return []
+
+    events: list[dict[str, Any]] = []
+
+    reasoning = internal.get("reasoning")
+    if reasoning:
+        reasoning_text = str(reasoning)
+        state.reasoning_parts.append(reasoning_text)
+        events.append(
+            _response_event(
+                state,
+                "response.reasoning_text.delta",
+                response_id=state.request_id,
+                item_id=f"rs_{state.request_id.removeprefix('resp_')}",
+                output_index=1 if state.output_started else 0,
+                content_index=0,
+                delta=reasoning_text,
+            )
+        )
+
+    text = internal.get("text")
+    if text:
+        text_delta = str(text)
+        events.extend(_ensure_response_text_output_events(state))
+        state.text_parts.append(text_delta)
+        events.append(
+            _response_event(
+                state,
+                "response.output_text.delta",
+                response_id=state.request_id,
+                item_id=state.message_item_id,
+                output_index=0,
+                content_index=0,
+                delta=text_delta,
+            )
+        )
+
+    tool_calls = internal.get("tool_calls") or []
+    if tool_calls:
+        for tool_call in _tool_calls_to_response_items(tool_calls):
+            output_index = (1 if state.output_started else 0) + len(state.tool_calls)
+            state.tool_calls.append(tool_call)
+            events.append(
+                _response_event(
+                    state,
+                    "response.output_item.added",
+                    response_id=state.request_id,
+                    output_index=output_index,
+                    item={**tool_call, "status": "in_progress"},
+                )
+            )
+            events.append(
+                _response_event(
+                    state,
+                    "response.output_item.done",
+                    response_id=state.request_id,
+                    output_index=output_index,
+                    item=tool_call,
+                )
+            )
+
+    finish_reason = normalize_finish_reason(internal.get("finish_reason"))
+    if finish_reason:
+        state.finish_reason = finish_reason
+
+    usage = internal.get("usage")
+    if usage:
+        state.usage = usage
+
+    return events
+
+
+def final_response_stream_events(
+    state: ResponsesStreamState,
+    *,
+    request_payload: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if state.done_sent:
+        return []
+    state.done_sent = True
+
+    events: list[dict[str, Any]] = []
+    output_text = "".join(state.text_parts)
+
+    if state.content_started:
+        content_part = {
+            "type": "output_text",
+            "text": output_text,
+            "annotations": [],
+        }
+        events.append(
+            _response_event(
+                state,
+                "response.output_text.done",
+                response_id=state.request_id,
+                item_id=state.message_item_id,
+                output_index=0,
+                content_index=0,
+                text=output_text,
+            )
+        )
+        events.append(
+            _response_event(
+                state,
+                "response.content_part.done",
+                response_id=state.request_id,
+                item_id=state.message_item_id,
+                output_index=0,
+                content_index=0,
+                part=content_part,
+            )
+        )
+        events.append(
+            _response_event(
+                state,
+                "response.output_item.done",
+                response_id=state.request_id,
+                output_index=0,
+                item=_response_message_item(state.message_item_id, output_text),
+            )
+        )
+
+    events.append(
+        _response_event(
+            state,
+            "response.completed",
+            response=_response_object_from_parts(
+                request_id=state.request_id,
+                model=state.model,
+                created=state.created,
+                status="completed",
+                output_text=output_text,
+                reasoning_text="".join(state.reasoning_parts),
+                tool_calls=state.tool_calls,
+                usage=state.usage,
+                request_payload=request_payload,
+            ),
+        )
+    )
+    return events
+
+
+def response_failed_event(
+    state: ResponsesStreamState,
+    *,
+    error: dict[str, Any],
+    request_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state.done_sent = True
+    return _response_event(
+        state,
+        "response.failed",
+        response=_response_object_from_parts(
+            request_id=state.request_id,
+            model=state.model,
+            created=state.created,
+            status="failed",
+            output_text="".join(state.text_parts),
+            reasoning_text="".join(state.reasoning_parts),
+            tool_calls=state.tool_calls,
+            usage=state.usage,
+            request_payload=request_payload,
+            error=error,
+            include_empty_message=False,
+        ),
+    )
 
 
 def _has_openai_visible_payload(internal: dict[str, Any]) -> bool:
@@ -168,6 +433,12 @@ def encode_sse_data(payload: dict[str, Any] | str) -> str:
     else:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return f"data: {body}\n\n"
+
+
+def encode_sse_event(payload: dict[str, Any]) -> str:
+    event_type = str(payload.get("type") or "message")
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event_type}\ndata: {body}\n\n"
 
 
 def aggregate_openai_response(
@@ -221,6 +492,42 @@ def aggregate_openai_response(
     if usage:
         response["usage"] = usage
     return response
+
+
+def aggregate_responses_response(
+    internal_chunks: list[dict[str, Any]],
+    *,
+    request_id: str,
+    model: str,
+    created: int,
+    request_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    usage: dict[str, Any] | None = None
+
+    for internal in internal_chunks:
+        if internal.get("text"):
+            content_parts.append(str(internal["text"]))
+        if internal.get("reasoning"):
+            reasoning_parts.append(str(internal["reasoning"]))
+        if internal.get("tool_calls"):
+            tool_calls.extend(_tool_calls_to_response_items(internal["tool_calls"]))
+        if internal.get("usage"):
+            usage = internal["usage"]
+
+    return _response_object_from_parts(
+        request_id=request_id,
+        model=model,
+        created=created,
+        status="completed",
+        output_text="".join(content_parts),
+        reasoning_text="".join(reasoning_parts),
+        tool_calls=tool_calls,
+        usage=usage,
+        request_payload=request_payload,
+    )
 
 
 def raycast_models_to_openai_models(payload: dict[str, Any], *, created: int = 0) -> dict[str, Any]:
@@ -386,6 +693,122 @@ def normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def normalize_responses_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+    output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+    total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    input_details = usage.get("input_tokens_details")
+    output_details = usage.get("output_tokens_details")
+    if not isinstance(input_details, dict):
+        input_details = {"cached_tokens": int(usage.get("cached_tokens", 0) or 0)}
+    if not isinstance(output_details, dict):
+        output_details = {
+            "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0)
+        }
+    return {
+        "input_tokens": input_tokens,
+        "input_tokens_details": input_details,
+        "output_tokens": output_tokens,
+        "output_tokens_details": output_details,
+        "total_tokens": total_tokens,
+    }
+
+
+def _responses_input_to_messages_and_instructions(
+    input_value: Any,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}], []
+
+    if not isinstance(input_value, list):
+        return [], []
+
+    messages: list[dict[str, Any]] = []
+    instruction_parts: list[str] = []
+    for item in input_value:
+        item_messages, item_instructions = _responses_item_to_messages_and_instructions(item)
+        messages.extend(item_messages)
+        instruction_parts.extend(item_instructions)
+
+    return messages, instruction_parts
+
+
+def _responses_item_to_messages_and_instructions(
+    item: Any,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if isinstance(item, str):
+        return [{"role": "user", "content": item}], []
+    if not isinstance(item, dict):
+        return [{"role": "user", "content": _responses_content_to_text(item)}], []
+
+    item_type = item.get("type")
+    if item_type == "function_call":
+        call_id = str(item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}")
+        return [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name"),
+                            "arguments": item.get("arguments", ""),
+                        },
+                    }
+                ],
+            }
+        ], []
+
+    if item_type == "function_call_output":
+        call_id = item.get("call_id") or item.get("id")
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": _responses_content_to_text(
+                    item.get("output", item.get("content", ""))
+                ),
+            }
+        ], []
+
+    if item_type in {"input_text", "output_text"}:
+        return [{"role": "user", "content": _responses_content_to_text(item)}], []
+
+    if item_type in {"reasoning", "item_reference"}:
+        return [], []
+
+    role = str(item.get("role") or "user")
+    text = _responses_content_to_text(item.get("content", item.get("text", "")))
+    if role in {"developer", "system"}:
+        return [], [text] if text else []
+    return [{"role": role, "content": text}], []
+
+
+def _responses_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        if isinstance(content.get("text"), str):
+            return content["text"]
+        if "content" in content:
+            return _responses_content_to_text(content["content"])
+        if "output" in content:
+            return _responses_content_to_text(content["output"])
+        return json.dumps(content, ensure_ascii=False)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            text = _responses_content_to_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
 def _messages_to_company(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     tool_call_names = _collect_tool_call_names(messages)
     return [_message_to_company(message, tool_call_names) for message in messages]
@@ -466,7 +889,13 @@ def _content_to_text(content: Any) -> str:
         for item in content:
             if isinstance(item, str):
                 parts.append(item)
-            elif isinstance(item, dict) and item.get("type") in {"text", "input_text"}:
+            elif isinstance(item, dict) and item.get("type") in {
+                "text",
+                "input_text",
+                "output_text",
+                "summary_text",
+                "reasoning_text",
+            }:
                 parts.append(str(item.get("text", "")))
         return "\n".join(part for part in parts if part)
     return str(content)
@@ -475,11 +904,19 @@ def _content_to_text(content: Any) -> str:
 def _tool_to_company(tool: dict[str, Any]) -> dict[str, Any]:
     tool_type = tool.get("type")
     if tool_type in {"function", "local_tool"}:
-        return _function_tool_to_local_tool(tool.get("function", {}))
+        return _function_tool_to_local_tool(tool.get("function") or tool)
     if tool_type == "remote_tool":
         return _function_tool_to_local_tool(tool)
     if "name" in tool:
         return _function_tool_to_local_tool(tool)
+    if tool_type:
+        return _function_tool_to_local_tool(
+            {
+                "name": tool_type,
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters", {}),
+            }
+        )
     return tool
 
 
@@ -524,6 +961,172 @@ def _arguments_to_string(arguments: Any) -> str:
     if isinstance(arguments, str):
         return arguments
     return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+
+
+def _ensure_response_text_output_events(state: ResponsesStreamState) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    if not state.output_started:
+        state.output_started = True
+        events.append(
+            _response_event(
+                state,
+                "response.output_item.added",
+                response_id=state.request_id,
+                output_index=0,
+                item={**_response_message_item(state.message_item_id, ""), "status": "in_progress"},
+            )
+        )
+    if not state.content_started:
+        state.content_started = True
+        events.append(
+            _response_event(
+                state,
+                "response.content_part.added",
+                response_id=state.request_id,
+                item_id=state.message_item_id,
+                output_index=0,
+                content_index=0,
+                part={"type": "output_text", "text": "", "annotations": []},
+            )
+        )
+    return events
+
+
+def _response_event(
+    state: ResponsesStreamState,
+    event_type: str,
+    **fields: Any,
+) -> dict[str, Any]:
+    event = {
+        "type": event_type,
+        "sequence_number": state.sequence_number,
+    }
+    state.sequence_number += 1
+    event.update(fields)
+    return event
+
+
+def _response_object_from_parts(
+    *,
+    request_id: str,
+    model: str,
+    created: int,
+    status: str,
+    output_text: str,
+    reasoning_text: str,
+    tool_calls: list[dict[str, Any]],
+    usage: dict[str, Any] | None,
+    request_payload: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
+    include_empty_message: bool = True,
+) -> dict[str, Any]:
+    request_payload = request_payload or {}
+    output = _response_output_items(
+        output_text,
+        reasoning_text,
+        tool_calls,
+        include_empty_message=include_empty_message,
+    )
+    response: dict[str, Any] = {
+        "id": request_id,
+        "object": "response",
+        "created_at": created,
+        "status": status,
+        "error": error,
+        "incomplete_details": None,
+        "model": model,
+        "output": output,
+        "output_text": output_text,
+        "parallel_tool_calls": request_payload.get("parallel_tool_calls", True),
+        "previous_response_id": request_payload.get("previous_response_id"),
+        "store": request_payload.get("store", False),
+        "tool_choice": request_payload.get("tool_choice", "auto"),
+        "tools": request_payload.get("tools", []),
+        "usage": normalize_responses_usage(usage) if usage else None,
+    }
+
+    optional_keys = (
+        "instructions",
+        "max_output_tokens",
+        "metadata",
+        "reasoning",
+        "temperature",
+        "text",
+        "top_p",
+        "truncation",
+        "user",
+    )
+    for key in optional_keys:
+        if key in request_payload:
+            response[key] = request_payload[key]
+
+    return response
+
+
+def _response_output_items(
+    output_text: str,
+    reasoning_text: str,
+    tool_calls: list[dict[str, Any]],
+    *,
+    include_empty_message: bool = True,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    if output_text or (include_empty_message and not tool_calls):
+        output.append(_response_message_item(f"msg_{uuid.uuid4().hex}", output_text))
+    if reasoning_text:
+        output.append(
+            {
+                "id": f"rs_{uuid.uuid4().hex}",
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [],
+                "content": [
+                    {
+                        "type": "reasoning_text",
+                        "text": reasoning_text,
+                    }
+                ],
+            }
+        )
+    output.extend(tool_calls)
+    return output
+
+
+def _response_message_item(item_id: str, output_text: str) -> dict[str, Any]:
+    return {
+        "id": item_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": output_text,
+                "annotations": [],
+            }
+        ],
+    }
+
+
+def _tool_calls_to_response_items(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_tool_call_to_response_item(tool_call) for tool_call in tool_calls]
+
+
+def _tool_call_to_response_item(tool_call: dict[str, Any]) -> dict[str, Any]:
+    call_id = str(tool_call.get("id") or tool_call.get("call_id") or f"call_{uuid.uuid4().hex}")
+    function = tool_call.get("function") or {}
+    return {
+        "id": tool_call.get("response_id") or f"fc_{uuid.uuid4().hex}",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": call_id,
+        "name": tool_call.get("name") or function.get("name"),
+        "arguments": _arguments_to_string(
+            tool_call.get("arguments")
+            if "arguments" in tool_call
+            else function.get("arguments", "")
+        ),
+    }
 
 
 def _stream_chunk(

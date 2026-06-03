@@ -1,7 +1,7 @@
 [project]
 name = "raycast-gateway"
 version = "0.1.0"
-description = "OpenAI-like chat completions gateway for the company API."
+description = "OpenAI-like chat completions and responses gateway for the company API."
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.115.6",
