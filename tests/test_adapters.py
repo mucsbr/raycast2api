@@ -563,6 +563,18 @@ def test_raycast_model_catalog_maps_ids_to_provider_and_model():
                     },
                 },
                 {
+                    "id": "anthropic-claude-opus-4-8",
+                    "model": "claude-opus-4-8",
+                    "provider": "anthropic",
+                    "abilities": {
+                        "reasoning_effort": {
+                            "supported": True,
+                            "options": ["none", "low", "medium", "high", "xhigh"],
+                            "default": "none",
+                        }
+                    },
+                },
+                {
                     "id": "openai_o1-gpt-5",
                     "model": "gpt-5",
                     "provider": "openai",
@@ -576,12 +588,22 @@ def test_raycast_model_catalog_maps_ids_to_provider_and_model():
         "google-gemini-3.5-flash": {
             "model": "gemini-3.5-flash",
             "provider": "google",
-            "reasoning_effort": "minimal",
+            "reasoning_effort": "high",
         },
         "gemini-3.5-flash": {
             "model": "gemini-3.5-flash",
             "provider": "google",
-            "reasoning_effort": "minimal",
+            "reasoning_effort": "high",
+        },
+        "anthropic-claude-opus-4-8": {
+            "model": "claude-opus-4-8",
+            "provider": "anthropic",
+            "reasoning_effort": "xhigh",
+        },
+        "claude-opus-4-8": {
+            "model": "claude-opus-4-8",
+            "provider": "anthropic",
+            "reasoning_effort": "xhigh",
         },
         "openai_o1-gpt-5": {
             "model": "gpt-5",

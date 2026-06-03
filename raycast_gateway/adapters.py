@@ -623,7 +623,7 @@ def raycast_model_catalog(payload: dict[str, Any]) -> dict[str, dict[str, str]]:
             "model": str(model_name),
             "provider": str(provider),
         }
-        reasoning_effort = _default_reasoning_effort(model)
+        reasoning_effort = _highest_reasoning_effort(model)
         if reasoning_effort is not None:
             entry["reasoning_effort"] = reasoning_effort
 
@@ -693,13 +693,18 @@ def split_model_for_company(model: str, default_provider: str) -> tuple[str, str
     return model, default_provider
 
 
-def _default_reasoning_effort(model: dict[str, Any]) -> str | None:
+def _highest_reasoning_effort(model: dict[str, Any]) -> str | None:
     abilities = model.get("abilities")
     if not isinstance(abilities, dict):
         return None
     reasoning_effort = abilities.get("reasoning_effort")
     if not isinstance(reasoning_effort, dict):
         return None
+    options = reasoning_effort.get("options")
+    if isinstance(options, list):
+        normalized_options = [str(option) for option in options if option is not None]
+        if normalized_options:
+            return normalized_options[-1]
     default = reasoning_effort.get("default")
     if default is None:
         return None
